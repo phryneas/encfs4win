@@ -147,7 +147,8 @@ void usage(const char *name)
 	<< _("  --reverse\t\t"  "reverse encryption\n")
 
 	// xgroup(usage)
-	<< _("\n"
+	<< _("  --extpass=program\tUse external program for password prompt\n"
+	"\n"
 	"Example, to mount at c:\\plain with raw storage in c:\\crypt :\n"
 	"    encfs c:\\crypt c:\\plain\n"
 	"\n")
@@ -228,6 +229,7 @@ bool processArgs(int argc, char *argv[], const shared_ptr<EncFS_Args> &out)
 	{"anykey", 0, 0, 'k'}, // skip key checks
 	{"no-default-flags", 0, 0, 'N'}, // don't use default fuse flags
 	{"ondemand", 0, 0, 'm'}, // mount on-demand
+	{"extpass", 1, 0, 'p'}, // external password program
 	// {"single-thread", 0, 0, 's'}, // single-threaded mode
 	{"stdinpass", 0, 0, 'S'}, // read password from stdin
 	{"verbose", 0, 0, 'v'}, // verbose mode
@@ -303,6 +305,9 @@ bool processArgs(int argc, char *argv[], const shared_ptr<EncFS_Args> &out)
 	case 'o':
 	    PUSHARG("-o");
 	    PUSHARG( optarg );
+	    break;
+	case 'p':
+	    out->opts->passwordProgram.assign( optarg );
 	    break;
 	case 'V':
 	    // xgroup(usage)

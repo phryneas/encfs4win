@@ -198,6 +198,9 @@ namespace boost
             }
             rInfo("subVersion = %i", cfg.subVersion);
 
+
+
+
             ar >> make_nvp("creator", cfg.creator);
             ar >> make_nvp("cipherAlg", cfg.cipherIface);
             ar >> make_nvp("nameAlg", cfg.nameIface);
@@ -359,6 +362,7 @@ ConfigType readConfig_load( ConfigInfo *nm, const char *path,
 	{
 	    err.log( _RLWarningChannel );
 	}
+
 
 	rError( _("Found config file %s, but failed to load"), path);
 	return Config_None;
@@ -1178,13 +1182,16 @@ RootPtr createV6Config( EncFS_Context *ctx,
 
     CipherKey volumeKey = cipher->newRandomKey();
 
+
     // get user key and use it to encode volume key
     CipherKey userKey;
     rDebug( "useStdin: %i", useStdin );
-    if(useStdin)
-        userKey = config->getUserKey( useStdin );
-    else
-        userKey = config->getNewUserKey();
+	if(useStdin)
+		userKey = config->getUserKey( useStdin );
+	else if(!passwordProgram.empty())
+		userKey = config->getUserKey( passwordProgram, rootDir );
+	else
+		userKey = config->getNewUserKey();
 
     cipher->writeKey( volumeKey, encodedKey, userKey );
     userKey.reset();
@@ -1201,6 +1208,8 @@ RootPtr createV6Config( EncFS_Context *ctx,
 
     if(!saveConfig( Config_V6, rootDir, config ))
 	return rootInfo;
+
+
 
     // fill in config struct
     shared_ptr<NameIO> nameCoder = NameIO::New( config->nameIface,
@@ -1444,113 +1453,138 @@ CipherKey EncFSConfig::getUserKey(bool useStdin)
     return userKey;
 }
 
-#if 0
-std::string readPassword( int FD )
-{
-    char buffer[1024];
-    string result;
+std::string readPassword(HANDLE g_hChildStd_OUT_Rd) {
+	string result;
 
-    while(1)
-    {
-	ssize_t rdSize = recv(FD, buffer, sizeof(buffer), 0);
+	DWORD dwRead;
+	CHAR chBuf[1024];
+	BOOL bSuccess = FALSE;
 
-	if(rdSize > 0)
-	{
-	    result.append( buffer, rdSize );
-	    memset(buffer, 0, sizeof(buffer));
-	} else
-	    break;
-    }
+	while(1) {
+		bSuccess = ReadFile( g_hChildStd_OUT_Rd, chBuf, 1024 , &dwRead, NULL);
+		if( ! bSuccess || dwRead == 0 ) break;
+		result.append( chBuf, dwRead );
+		memset(chBuf, 0, sizeof(chBuf));
+	}
 
-    // chop off trailing "\n" if present..
-    // This is done so that we can use standard programs like ssh-askpass
-    // without modification, as it returns trailing newline..
-    if(!result.empty() && result[ result.length()-1 ] == '\n' )
-	result.resize( result.length() -1 );
+	// chop off trailing "\r\n" or "\n" if present..
+	// This is done so that we can use standard programs like ssh-askpass
+	// without modification, as it returns trailing newline..
+	if(!result.empty() && result[ result.length()-2 ] == '\r' && result[ result.length()-1 ] == '\n' )
+		result.resize( result.length() -2 );
+	else if(!result.empty() && result[ result.length()-1 ] == '\n' )
+		result.resize( result.length() -1 );
 
-    return result;
+	return result;
 }
+
+
 
 CipherKey EncFSConfig::getUserKey( const std::string &passProg,
-        const std::string &rootDir )
-{
-    // have a child process run the command and get the result back to us.
-    int fds[2], pid;
-    int res;
-    CipherKey result;
+                                   const std::string &rootDir ) {
 
-    res = socketpair(PF_UNIX, SOCK_STREAM, 0, fds);
-    if(res == -1)
-    {
-	perror(_("Internal error: socketpair() failed"));
-	return result;
-    }
-    rDebug("getUserKey: fds = %i, %i", fds[0], fds[1]);
+	CipherKey result;
 
-    pid = fork();
-    if(pid == -1)
-    {
-	perror(_("Internal error: fork() failed"));
-	close(fds[0]);
-	close(fds[1]);
-	return result;
-    }
+	//see http://msdn.microsoft.com/en-us/library/windows/desktop/ms682499%28v=vs.85%29.aspx
 
-    if(pid == 0)
-    {
-	const char *argv[4];
-	argv[0] = "/bin/sh";
-	argv[1] = "-c";
-	argv[2] = passProg.c_str();
-	argv[3] = 0;
+    // Set the bInheritHandle flag so pipe handles are inherited.
+	SECURITY_ATTRIBUTES saAttr;
+	saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+	saAttr.bInheritHandle = TRUE;
+	saAttr.lpSecurityDescriptor = NULL;
 
-	// child process.. run the command and send output to fds[0]
-	close(fds[1]); // we don't use the other half..
 
-	// make a copy of stdout and stderr descriptors, and set an environment
-	// variable telling where to find them, in case a child wants it..
-	int stdOutCopy = dup( STDOUT_FILENO );
-	int stdErrCopy = dup( STDERR_FILENO );
-	// replace STDOUT with our socket, which we'll used to receive the
-	// password..
-	dup2( fds[0], STDOUT_FILENO );
+	// Create a pipe for the child process's STDOUT.
+	HANDLE g_hChildStd_OUT_Rd = NULL;
+	HANDLE g_hChildStd_OUT_Wr = NULL;
+	if ( ! CreatePipe(&g_hChildStd_OUT_Rd, &g_hChildStd_OUT_Wr, &saAttr, 0) ){
+		perror(_("CreatePipe for STDOUT failed"));
+		return result;
+	}
+    // Ensure the read handle to the pipe for STDOUT is not inherited.
+	if ( ! SetHandleInformation(g_hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0) )
+		perror(_("SetHandleInformation on STDOUT pipe failed"));
 
-	// ensure that STDOUT_FILENO and stdout/stderr are not closed on exec..
-	fcntl(STDOUT_FILENO, F_SETFD, 0); // don't close on exec..
-	fcntl(stdOutCopy, F_SETFD, 0);
-	fcntl(stdErrCopy, F_SETFD, 0);
+	// stderr will be redirected to this processes' stderr
+	HANDLE parent_stderr;
+	if (!DuplicateHandle( GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE),  GetCurrentProcess(), &parent_stderr, 0, TRUE, DUPLICATE_SAME_ACCESS)){
+		perror(_("DuplicateHandle on STDERR failed"));
+		return result;
+	}
 
-	char tmpBuf[8];
 
-	setenv(ENCFS_ENV_ROOTDIR, rootDir.c_str(), 1);
-
-	snprintf(tmpBuf, sizeof(tmpBuf)-1, "%i", stdOutCopy);
-	setenv(ENCFS_ENV_STDOUT, tmpBuf, 1);
+	//initialize program name as wide char array
+	LPWSTR szCmdline = new wchar_t[passProg.size()+1];
+	std::copy( passProg.begin(), passProg.end(), szCmdline );
+	szCmdline[passProg.size()] = 0; // zero at the end
 	
-	snprintf(tmpBuf, sizeof(tmpBuf)-1, "%i", stdErrCopy);
-	setenv(ENCFS_ENV_STDERR, tmpBuf, 1);
+	// Create a child process that uses the previously created pipes for STDOUT
+	PROCESS_INFORMATION piProcInfo;
+	STARTUPINFO siStartInfo;
+	BOOL bSuccess = FALSE;
 
-	execvp( argv[0], (char * const *)argv ); // returns only on error..
+    // Set up members of the PROCESS_INFORMATION structure.
+	ZeroMemory( &piProcInfo, sizeof(PROCESS_INFORMATION) );
 
-	perror(_("Internal error: failed to exec program"));
-	exit(1);
-    }
+    // Set up members of the STARTUPINFO structure.
+    // This structure specifies the STDIN and STDOUT handles for redirection.
+	ZeroMemory( &siStartInfo, sizeof(STARTUPINFO) );
+	siStartInfo.cb = sizeof(STARTUPINFO);
+	//siStartInfo.hStdError = g_hChildStd_OUT_Wr; //stdErr should just be inherited
+	siStartInfo.hStdOutput = g_hChildStd_OUT_Wr;
+	siStartInfo.hStdError = parent_stderr;
+	siStartInfo.dwFlags |= STARTF_USESTDHANDLES;
 
-    close(fds[0]);
-    string password = readPassword(fds[1]);
-    close(fds[1]);
+	// set environment
+	LPWSTR rootDirWide = new wchar_t[rootDir.size()+1];
+	std::copy( rootDir.begin(), rootDir.end(), rootDirWide );
+	rootDirWide[rootDir.size()] = 0; // zero at the end
+	SetEnvironmentVariable(TEXT("ENCFS_ENV_ROOTDIR"), rootDirWide);
+	//TODO: missing env variables: parent stdout and stderr pipes
+	//setenv(ENCFS_ENV_STDOUT, tmpBuf, 1);
+	//setenv(ENCFS_ENV_STDERR, tmpBuf, 1);
 
-    waitpid(pid, NULL, 0);
 
-    // convert to key..
-    result = makeKey(password.c_str(), password.length());
+    // Create the child process.
+	bSuccess = CreateProcess(NULL,
+	                         szCmdline,     // command line
+	                         NULL,          // process security attributes
+	                         NULL,          // primary thread security attributes
+	                         TRUE,          // handles are inherited
+	                         0,             // creation flags
+	                         NULL,          // use parent's environment
+	                         NULL,          // use parent's current directory
+	                         &siStartInfo,  // STARTUPINFO pointer
+	                         &piProcInfo);  // receives PROCESS_INFORMATION
 
-    // clear buffer..
-    password.assign( password.length(), '\0' );
 
-    return result;
+	if ( ! bSuccess ){
+		perror(_("CreateProcess failed"));
+		return result;
+	}
+
+
+	cout << "waiting for password on stdout...";
+	//close parent process writehandle so that the child process can close the pipe on exit/error
+	CloseHandle(g_hChildStd_OUT_Wr);
+	//read password from child stdout using ReadFile
+	string password = readPassword(g_hChildStd_OUT_Rd);
+	CloseHandle(g_hChildStd_OUT_Rd);
+	cout << "OK!" << endl;
+
+	//waitpid(pid, NULL, 0);
+	WaitForSingleObject(piProcInfo.hProcess, INFINITE);
+	CloseHandle(piProcInfo.hProcess);
+	CloseHandle(piProcInfo.hThread);
+
+	// convert to key..
+	result = makeKey(password.c_str(), password.length());
+
+	// clear buffer..
+	password.assign( password.length(), '\0' );
+
+	return result;
 }
-#endif
 
 CipherKey EncFSConfig::getNewUserKey()
 {
@@ -1618,8 +1652,16 @@ RootPtr initFS( EncFS_Context *ctx, const shared_ptr<EncFS_Opts> &opts )
 	// get user key
 	CipherKey userKey;
 
-	rDebug( "useStdin: %i", opts->useStdin );
-	userKey = config->getUserKey( opts->useStdin );
+		if(opts->passwordProgram.empty())
+        {
+            rDebug( "useStdin: %i", opts->useStdin );
+            userKey = config->getUserKey( opts->useStdin );
+        } else
+            userKey = config->getUserKey( opts->passwordProgram, opts->rootDir );
+
+
+
+
 
 	if(!userKey)
 	    return rootInfo;
